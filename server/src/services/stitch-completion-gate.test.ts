@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { verifyStitchCompletion, verifyStitchScreen, rejectInitialStitchDone } from "./stitch-completion-gate.js";
+import { verifyStitchCompletion, verifyStitchScreen, rejectInitialStitchDone, stitchGateConfig } from "./stitch-completion-gate.js";
 
 const companyId="company-test";
 const designerId="design-agent-test";
@@ -12,6 +12,13 @@ describe("precommit Stitch status gate",()=>{
     const verify=vi.fn(async()=>true);
     await expect(verifyStitchCompletion({...config,issue,comments:[proof],verify})).resolves.toBeUndefined();
     expect(verify).toHaveBeenCalledWith("projects/12","screens/34");
+  });
+  it("uses the newest valid Stitch proof instead of an older stale proof",async()=>{
+    const newer={...proof,body:'STITCH_EVIDENCE: {"project_id":"projects/new","screen_id":"screens/new"}'};
+    const older={...proof,body:'STITCH_EVIDENCE: {"project_id":"projects/old","screen_id":"screens/old"}'};
+    const verify=vi.fn(async(p:string,s:string)=>p==="projects/new" && s==="screens/new");
+    await expect(verifyStitchCompletion({...config,issue,comments:[newer,older],verify})).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledWith("projects/new","screens/new");
   });
   it("blocks absent evidence, without calling the network",async()=>{
     const verify=vi.fn(async()=>true);
@@ -64,8 +71,39 @@ describe("Stitch MCP integration",()=>{
         {status:200,headers:{"Mcp-Session-Id":"s-123"}});
     }));
     await expect(verifyStitchScreen("projects/12","screens/34")).resolves.toBe(true);
-    expect(calls[1].params.arguments.name).toBe("projects/12/screens/34");
-    expect(calls.map(x=>x.method)).toEqual(["initialize","tools/call"]);
+    expect(calls[2].params.arguments.name).toBe("projects/12/screens/34");
+    expect(calls.map(x=>x.method)).toEqual(["initialize","notifications/initialized","tools/call"]);
+  });
+  it("performs MCP initialize notification with negotiated protocol version",async()=>{
+    const calls:any[]=[];
+    vi.stubGlobal("fetch",vi.fn(async(_url:string,init:any)=>{
+      const body=JSON.parse(init.body);
+      calls.push({body,headers:init.headers});
+      if(body.method==="notifications/initialized"){
+        return new Response(null,{status:202});
+      }
+      const result=body.method==="initialize"
+        ? {protocolVersion:"2025-03-26",serverInfo:{name:"stitch-proxy"}}
+        : {content:[{type:"text",text:"screen found"}]};
+      return new Response("data: "+JSON.stringify({jsonrpc:"2.0",id:body.id,result})+"\n\n",
+        {status:200,headers:{"Mcp-Session-Id":"s-123"}});
+    }));
+    await expect(verifyStitchScreen("projects/12","screens/34")).resolves.toBe(true);
+    expect(calls.map(x=>x.body.method)).toEqual(["initialize","notifications/initialized","tools/call"]);
+    expect(calls[2].headers["MCP-Protocol-Version"]).toBe("2025-03-26");
+  });
+  it("accepts a standards-compliant multiline SSE JSON result",async()=>{
+    vi.stubGlobal("fetch",vi.fn(async(_url:string,init:any)=>{
+      const msg=JSON.parse(init.body);
+      if(msg.method==="notifications/initialized")return new Response(null,{status:202});
+      const data={jsonrpc:"2.0",id:msg.id,result:msg.method==="initialize" ?
+        {protocolVersion:"2025-03-26"} : {content:[{type:"text",text:"screen"}]}};
+      const json=JSON.stringify(data);
+      const idx=json.indexOf(',"result"')+1;
+      const body="event: message\ndata: "+json.slice(0,idx)+"\ndata: "+json.slice(idx)+"\n\n";
+      return new Response(body,{status:200});
+    }));
+    await expect(verifyStitchScreen("projects/12","screens/34")).resolves.toBe(true);
   });
   it("fails closed when Stitch MCP returns an error",async()=>{
     vi.stubGlobal("fetch",vi.fn(async(_url: string,init: any)=>{
@@ -80,6 +118,21 @@ describe("Stitch MCP integration",()=>{
   });
 });
 
+
+describe("scope normalization",()=>{
+  it("normalizes uppercase config UUIDs to match database IDs",()=>{
+    const company="16cfee44-52ba-4fb8-bc24-d4a2edfd00db";
+    const designer="4b21d3b2-9d11-4b1c-884e-292742b7894a";
+    expect(stitchGateConfig({
+      PAPERCLIP_STITCH_GATE_COMPANY_ID:company.toUpperCase(),
+      PAPERCLIP_STITCH_GATE_AGENT_ID:designer.toUpperCase(),
+    })).toEqual({companyId:company,designerId:designer});
+    expect(stitchGateConfig({
+      PAPERCLIP_STITCH_GATE_COMPANY_ID:"invalid",
+      PAPERCLIP_STITCH_GATE_AGENT_ID:designer,
+    })).toBeNull();
+  });
+});
 
 describe("reviewed design fallback",()=>{
   const fallback={authorAgentId:designerId,

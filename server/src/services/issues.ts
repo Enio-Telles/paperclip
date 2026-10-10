@@ -11244,8 +11244,9 @@ export function issueService(db: Db) {
               isNull(issueComments.deletedAt),
               eq(issueComments.authorAgentId, stitchGate.designerId),
             ))
-            .orderBy(desc(issueComments.createdAt))
-            .limit(30);
+            // All designer comments: evidence must not be silently omitted
+            // merely because more than thirty later comments were added.
+            .orderBy(desc(issueComments.createdAt));
           const approvedAlternatives = await tx
             .select({
               id: issueWorkProducts.id,

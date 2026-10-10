@@ -49,7 +49,8 @@ Set BOTH of the following in the Paperclip server process environment:
 The feature is disabled by default. A checkout containing these source files
 does NOT mean the currently running Paperclip process has this feature.
 Build and deploy the matching server version, verify CLI/UI compatibility,
-back up the embedded database, and restart safely before enabling.
+back up the CONFIGURED database (embedded or external PostgreSQL, including
+DATABASE_URL deployments), and restart safely before enabling.
 
 The gate is server-service-level (covers service update and create
 calls); it does not protect against SQL writes that bypass issueService.
@@ -62,6 +63,9 @@ Run focused tests:
 
     pnpm exec vitest run server/src/services/stitch-completion-gate.test.ts
 
-The deployed extension is distinct from the existing read-only IAudit audit
-service; the latter continues detecting historical/policy violations
-without changing status.
+An independent read-only IAudit audit timer can be installed from the
+external Enio-Telles/iaudit repository (scripts/stitch_gate_audit.py
+with its --since boundary). This repository does not deploy that timer.
+Verify it is installed and active separately; do not assume historic
+completions are checked. Neither this gate nor the optional audit checks
+arbitrary SQL writes that bypass the Paperclip issue service.

@@ -71,10 +71,10 @@ function fallbackEvidence(comment: StitchComment, author: string):
 }
 function validReviewedFallback(options:StitchDoneGateOptions): boolean {
   const {issue,comments,workProducts=[],designerId}=options;
-  for(const comment of [...comments].reverse()){
+  for(const comment of comments){
     const proof=fallbackEvidence(comment,designerId);
     if(!proof)continue;
-    const product=workProducts.find(x=>x.id===proof.workProductId &&
+    const product=workProducts.find(x=>x.id.toLowerCase()===proof.workProductId.toLowerCase() &&
       x.companyId===issue.companyId && x.issueId===issue.id &&
       x.reviewState==="approved" && x.status==="approved" &&
       (x.type==="artifact" || x.type==="preview_url" || x.type==="document") &&
@@ -89,7 +89,7 @@ function validReviewedFallback(options:StitchDoneGateOptions): boolean {
 export async function verifyStitchCompletion(options: StitchDoneGateOptions): Promise<void> {
   const {companyId, designerId, issue, comments, verify} = options;
   if (issue.companyId !== companyId || issue.assigneeAgentId !== designerId) return;
-  const pair=[...comments].reverse().map((x)=>parseEvidence(x,designerId)).find((x)=>x!==null);
+  const pair=comments.map((x)=>parseEvidence(x,designerId)).find((x)=>x!==null);
   if(pair){
     try{if(await verify(...pair))return;}catch{/* try a reviewed alternate design */}
   }
@@ -98,13 +98,25 @@ export async function verifyStitchCompletion(options: StitchDoneGateOptions): Pr
 }
 
 function parseSse(body: string, requestId: number): Record<string,any> {
-  const candidates=body.trimStart().startsWith("{") ? [body] :
-    body.split(/\r?\n/).filter((line)=>line.startsWith("data:")).map((line)=>line.slice(5).trim());
-  for (const candidate of candidates) {
-    try {
-      const data=JSON.parse(candidate);
-      if (data.id===requestId && data.result) return data.result as Record<string,any>;
-    } catch { /* SSE heartbeat */ }
+  if(body.trimStart().startsWith("{")){
+    const data=JSON.parse(body);
+    if(data.id===requestId && data.result)return data.result as Record<string,any>;
+  }
+  const events:string[]=[];
+  let lines:string[]=[];
+  for(const line of body.split(/\r?\n/)){
+    if(line.startsWith("data:"))lines.push(line.slice(5).trimStart());
+    else if(line===""){
+      if(lines.length)events.push(lines.join("\n"));
+      lines=[];
+    }
+  }
+  if(lines.length)events.push(lines.join("\n"));
+  for(const item of events){
+    try{
+      const data=JSON.parse(item);
+      if(data.id===requestId && data.result)return data.result as Record<string,any>;
+    }catch{/* SSE heartbeat or non-JSON event */}
   }
   throw Error("Missing MCP response");
 }
@@ -112,26 +124,55 @@ function parseSse(body: string, requestId: number): Record<string,any> {
 export async function verifyStitchScreen(projectId: string, screenId: string): Promise<boolean> {
   const canonical="projects/"+projectId.replace(/^projects\//,"")+
     "/screens/"+screenId.replace(/^screens\//,"");
-  let sessionId: string|null=null;
-  const exchange=async(id:number,method:string,params:Record<string,unknown>)=>{
+  let sessionId:string|null=null;
+  let version:string|null=null;
+  const exchange=async(id:number|null,method:string,params:Record<string,unknown>)=>{
     const headers:Record<string,string>={
       "Content-Type":"application/json",Accept:"application/json, text/event-stream",
     };
-    if(sessionId) headers["Mcp-Session-Id"]=sessionId;
+    if(sessionId)headers["Mcp-Session-Id"]=sessionId;
+    if(version)headers["MCP-Protocol-Version"]=version;
+    const payload:Record<string,unknown>={jsonrpc:"2.0",method,params};
+    if(id!==null)payload.id=id;
     const response=await fetch(STITCH_MCP_URL,{
       method:"POST",headers,signal:AbortSignal.timeout(3500),
-      body:JSON.stringify({jsonrpc:"2.0",id,method,params}),
+      body:JSON.stringify(payload),
     });
-    if(!response.ok) throw Error("Stitch MCP unavailable");
+    if(!response.ok)throw Error("Stitch MCP unavailable");
     sessionId=response.headers.get("mcp-session-id") ?? sessionId;
-    const body=await response.text();
-    if(body.length>12_000_000) throw Error("Stitch MCP oversized response");
+    if(id===null){
+      await response.body?.cancel();
+      return {};
+    }
+    const maxBytes=12_000_000;
+    const declared=Number(response.headers.get("content-length") ?? 0);
+    if(declared>maxBytes)throw Error("Stitch MCP oversized response");
+    if(!response.body)throw Error("Stitch MCP empty response");
+    const reader=response.body.getReader();
+    const decoder=new TextDecoder();
+    let body="";
+    let count=0;
+    try{
+      while(true){
+        const {done,value}=await reader.read();
+        if(done)break;
+        count+=value.byteLength;
+        if(count>maxBytes){
+          await reader.cancel("MCP size cap");
+          throw Error("Stitch MCP oversized response");
+        }
+        body+=decoder.decode(value,{stream:true});
+      }
+      body+=decoder.decode();
+    }finally{reader.releaseLock();}
     return parseSse(body,id);
   };
-  await exchange(1,"initialize",{
+  const init=await exchange(1,"initialize",{
     protocolVersion:"2025-03-26",capabilities:{},
     clientInfo:{name:"paperclip-stitch-gate",version:"1"},
   });
+  version=typeof init.protocolVersion==="string" ? init.protocolVersion : "2025-03-26";
+  await exchange(null,"notifications/initialized",{});
   const result=await exchange(2,"tools/call",{name:"get_screen",arguments:{name:canonical}});
   return result.isError!==true &&
     ((Array.isArray(result.content) && result.content.length>0) || !!result.structuredContent);
@@ -139,8 +180,8 @@ export async function verifyStitchScreen(projectId: string, screenId: string): P
 
 export function stitchGateConfig(env:NodeJS.ProcessEnv=process.env):
   {companyId:string;designerId:string}|null {
-  const companyId=env.PAPERCLIP_STITCH_GATE_COMPANY_ID;
-  const designerId=env.PAPERCLIP_STITCH_GATE_AGENT_ID;
-  if(!companyId||!designerId) return null;
+  const companyId=env.PAPERCLIP_STITCH_GATE_COMPANY_ID?.trim().toLowerCase();
+  const designerId=env.PAPERCLIP_STITCH_GATE_AGENT_ID?.trim().toLowerCase();
+  if(!companyId||!designerId || !UUID.test(companyId) || !UUID.test(designerId))return null;
   return {companyId,designerId};
 }
