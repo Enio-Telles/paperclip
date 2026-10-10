@@ -3,6 +3,7 @@ import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, a
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { rejectInitialStitchDone, stitchGateConfig, verifyStitchCompletion, verifyStitchScreen } from "./stitch-completion-gate.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
@@ -10395,6 +10396,22 @@ export function issueService(db: Db) {
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
+        // A new design issue cannot start at Done because no Stitch proof
+        // comment can exist prior to insertion.
+        const designGate = stitchGateConfig();
+        if (designGate) {
+          try {
+            rejectInitialStitchDone({
+              ...designGate,
+              issue: { id: "", companyId, assigneeAgentId: values.assigneeAgentId,
+                status: values.status ?? "backlog" },
+            });
+          } catch {
+            throw conflict("Stitch evidence is required before creating a completed design issue", {
+              code: "stitch_evidence_required",
+            });
+          }
+        }
         if (values.status === "done") {
           values.completedAt = new Date();
         }
@@ -11208,6 +11225,40 @@ export function issueService(db: Db) {
             patch.privacyRootIssueId = privacyParent.privacyRootIssueId ?? privacyParent.id;
           } else if (issueData.visibility === "private") {
             patch.privacyRootIssueId = receiptExisting.id;
+          }
+        }
+        // The Stitch design gate is checked while the issue row is locked,
+        // BEFORE the status write. It is scope-limited and disabled unless
+        // PAPERCLIP_STITCH_GATE_COMPANY_ID/AGENT_ID are explicitly configured.
+        const stitchGate = stitchGateConfig();
+        if (stitchGate && patch.status === "done" && receiptExisting.status !== "done"
+          && receiptExisting.companyId === stitchGate.companyId
+          && (receiptExisting.assigneeAgentId === stitchGate.designerId ||
+              patch.assigneeAgentId === stitchGate.designerId)) {
+          const evidence = await tx
+            .select({ authorAgentId: issueComments.authorAgentId, body: issueComments.body })
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.companyId, receiptExisting.companyId),
+              eq(issueComments.issueId, receiptExisting.id),
+              isNull(issueComments.deletedAt),
+              eq(issueComments.authorAgentId, stitchGate.designerId),
+            ))
+            .orderBy(desc(issueComments.createdAt))
+            .limit(30);
+          try {
+            await verifyStitchCompletion({
+              ...stitchGate,
+              issue: { id: receiptExisting.id, companyId: receiptExisting.companyId,
+                assigneeAgentId: stitchGate.designerId,
+                status: receiptExisting.status },
+              comments: evidence,
+              verify: verifyStitchScreen,
+            });
+          } catch {
+            throw conflict("Stitch screen verification is required before design completion", {
+              code: "stitch_evidence_required",
+            });
           }
         }
         if (actorAgentId && actorRunId) {
