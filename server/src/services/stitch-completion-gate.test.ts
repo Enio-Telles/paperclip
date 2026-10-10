@@ -85,8 +85,8 @@ describe("reviewed design fallback",()=>{
   const fallback={authorAgentId:designerId,
     body:'DESIGN_FALLBACK_EVIDENCE: {"reason":"stitch_unavailable","method":"agy-carine","work_product_id":"11111111-1111-4111-8111-111111111111"}'};
   const product={id:"11111111-1111-4111-8111-111111111111",
-    issueId:issue.id,companyId,reviewState:"approved",status:"completed",
-    type:"artifact",provider:"agy-carine",url:"https://example.org/design-preview"};
+    issueId:issue.id,companyId,reviewState:"approved",status:"approved",
+    type:"preview_url",provider:"agy-carine",url:"https://example.org/design-preview"};
   it("accepts an approved real work product when Stitch is unavailable",async()=>{
     await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
       workProducts:[product],verify:async()=>{throw Error("Stitch offline")}})).resolves.toBeUndefined();

@@ -26,7 +26,7 @@ unsupported_request and user_choice. Supported methods/providers: figma,
 agy-carine, frontend-code and manual.
 
 The work product MUST belong to the same issue and company and have matching
-provider, status completed, reviewState approved and a valid https preview URL
+provider, status approved, reviewState approved and a valid https preview URL
 (or local loopback preview). Unsupported/unreviewed claims cannot complete the task.
 Only the Design Specialist can author either receipt. A reviewed alternative
 does NOT need a Stitch screen ID. No automated call to a paid model is required

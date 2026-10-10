@@ -76,8 +76,8 @@ function validReviewedFallback(options:StitchDoneGateOptions): boolean {
     if(!proof)continue;
     const product=workProducts.find(x=>x.id===proof.workProductId &&
       x.companyId===issue.companyId && x.issueId===issue.id &&
-      x.reviewState==="approved" && x.status==="completed" &&
-      (x.type==="artifact" || x.type==="preview" || x.type==="design") &&
+      x.reviewState==="approved" && x.status==="approved" &&
+      (x.type==="artifact" || x.type==="preview_url" || x.type==="document") &&
       x.provider===proof.method &&
       typeof x.url==="string" &&
       (/^https:\/\/[^\s]+$/i.test(x.url) || /^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(x.url)));
