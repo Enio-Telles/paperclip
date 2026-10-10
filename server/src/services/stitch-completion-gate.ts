@@ -6,9 +6,14 @@
 export interface StitchComment { authorAgentId?: string | null; body: string }
 export interface StitchIssue { id: string; companyId: string; assigneeAgentId?: string | null; status: string }
 export type StitchVerify = (projectId: string, screenId: string) => Promise<boolean>;
+export interface DesignWorkProduct {
+  id: string; companyId: string; issueId: string; type: string;
+  provider: string; status: string; reviewState: string; url?: string | null;
+}
 export interface StitchDoneGateOptions {
   companyId: string; designerId: string; issue: StitchIssue;
   comments: StitchComment[]; verify: StitchVerify;
+  workProducts?: DesignWorkProduct[];
 }
 
 const PREFIX = "STITCH_EVIDENCE:";
@@ -41,14 +46,55 @@ export function rejectInitialStitchDone({
     throw Error("Stitch proof required before initial design Done");
 }
 
+const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+const FALLBACK_REASONS = new Set([
+  "stitch_unavailable","quota_exceeded","integration_error","unsupported_request","user_choice",
+]);
+const FALLBACK_METHODS = new Set(["figma","agy-carine","frontend-code","manual"]);
+function fallbackEvidence(comment: StitchComment, author: string):
+    {reason:string;method:string;workProductId:string}|null {
+  if(comment.authorAgentId!==author)return null;
+  for(const line of comment.body.split(/\r?\n/)){
+    if(!line.startsWith("DESIGN_FALLBACK_EVIDENCE:") || line.length>550)continue;
+    try {
+      const raw:unknown=JSON.parse(line.slice("DESIGN_FALLBACK_EVIDENCE:".length).trim());
+      if(!raw || typeof raw!=="object" || Array.isArray(raw))continue;
+      const data=raw as Record<string,unknown>;
+      if(Object.keys(data).sort().join(",")!=="method,reason,work_product_id")continue;
+      if(typeof data.reason!=="string" || !FALLBACK_REASONS.has(data.reason))continue;
+      if(typeof data.method!=="string" || !FALLBACK_METHODS.has(data.method))continue;
+      if(typeof data.work_product_id!=="string" || !UUID.test(data.work_product_id))continue;
+      return {reason:data.reason,method:data.method,workProductId:data.work_product_id};
+    }catch{/*invalid fallback evidence*/}
+  }
+  return null;
+}
+function validReviewedFallback(options:StitchDoneGateOptions): boolean {
+  const {issue,comments,workProducts=[],designerId}=options;
+  for(const comment of [...comments].reverse()){
+    const proof=fallbackEvidence(comment,designerId);
+    if(!proof)continue;
+    const product=workProducts.find(x=>x.id===proof.workProductId &&
+      x.companyId===issue.companyId && x.issueId===issue.id &&
+      x.reviewState==="approved" && x.status==="completed" &&
+      (x.type==="artifact" || x.type==="preview" || x.type==="design") &&
+      x.provider===proof.method &&
+      typeof x.url==="string" &&
+      (/^https:\/\/[^\s]+$/i.test(x.url) || /^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(x.url)));
+    if(product)return true;
+  }
+  return false;
+}
+
 export async function verifyStitchCompletion(options: StitchDoneGateOptions): Promise<void> {
   const {companyId, designerId, issue, comments, verify} = options;
   if (issue.companyId !== companyId || issue.assigneeAgentId !== designerId) return;
-  const pair = [...comments].reverse().map((x)=>parseEvidence(x,designerId)).find((x)=>x !== null);
-  if (!pair) throw Error("Stitch proof required: add STITCH_EVIDENCE before Done");
-  let accepted=false;
-  try { accepted=await verify(...pair); } catch { /* fail closed on outages */ }
-  if (!accepted) throw Error("Stitch screen verification failed; keep issue in_review");
+  const pair=[...comments].reverse().map((x)=>parseEvidence(x,designerId)).find((x)=>x!==null);
+  if(pair){
+    try{if(await verify(...pair))return;}catch{/* try a reviewed alternate design */}
+  }
+  if(validReviewedFallback(options))return;
+  throw Error("Design completion needs verified Stitch screen or an approved alternative work product");
 }
 
 function parseSse(body: string, requestId: number): Record<string,any> {

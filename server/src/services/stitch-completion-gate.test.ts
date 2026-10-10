@@ -79,3 +79,31 @@ describe("Stitch MCP integration",()=>{
     await expect(verifyStitchScreen("projects/12","screens/unknown")).resolves.toBe(false);
   });
 });
+
+
+describe("reviewed design fallback",()=>{
+  const fallback={authorAgentId:designerId,
+    body:'DESIGN_FALLBACK_EVIDENCE: {"reason":"stitch_unavailable","method":"agy-carine","work_product_id":"11111111-1111-4111-8111-111111111111"}'};
+  const product={id:"11111111-1111-4111-8111-111111111111",
+    issueId:issue.id,companyId,reviewState:"approved",status:"completed",
+    type:"artifact",provider:"agy-carine",url:"https://example.org/design-preview"};
+  it("accepts an approved real work product when Stitch is unavailable",async()=>{
+    await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
+      workProducts:[product],verify:async()=>{throw Error("Stitch offline")}})).resolves.toBeUndefined();
+  });
+  it("rejects an unapproved fallback work product",async()=>{
+    await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
+      workProducts:[{...product,reviewState:"none"}],verify:async()=>false})).rejects.toThrow();
+  });
+  it("rejects work products from another issue or a forged fallback comment",async()=>{
+    await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
+      workProducts:[{...product,issueId:"other"}],verify:async()=>false})).rejects.toThrow();
+    await expect(verifyStitchCompletion({...config,issue,comments:[{...fallback,authorAgentId:"other"}],
+      workProducts:[product],verify:async()=>false})).rejects.toThrow();
+  });
+  it("accepts deliberate alternative design only with reviewed artifact",async()=>{
+    await expect(verifyStitchCompletion({...config,issue,comments:[{
+      ...fallback,body:fallback.body.replace("stitch_unavailable","user_choice").replace("agy-carine","figma"),
+    }],workProducts:[{...product,provider:"figma"}],verify:async()=>false})).resolves.toBeUndefined();
+  });
+});

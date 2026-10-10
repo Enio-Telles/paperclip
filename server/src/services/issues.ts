@@ -11246,6 +11246,24 @@ export function issueService(db: Db) {
             ))
             .orderBy(desc(issueComments.createdAt))
             .limit(30);
+          const approvedAlternatives = await tx
+            .select({
+              id: issueWorkProducts.id,
+              companyId: issueWorkProducts.companyId,
+              issueId: issueWorkProducts.issueId,
+              type: issueWorkProducts.type,
+              provider: issueWorkProducts.provider,
+              status: issueWorkProducts.status,
+              reviewState: issueWorkProducts.reviewState,
+              url: issueWorkProducts.url,
+            })
+            .from(issueWorkProducts)
+            .where(and(
+              eq(issueWorkProducts.companyId,receiptExisting.companyId),
+              eq(issueWorkProducts.issueId,receiptExisting.id),
+              eq(issueWorkProducts.reviewState,"approved"),
+            ))
+            .limit(100);
           try {
             await verifyStitchCompletion({
               ...stitchGate,
@@ -11253,10 +11271,11 @@ export function issueService(db: Db) {
                 assigneeAgentId: stitchGate.designerId,
                 status: receiptExisting.status },
               comments: evidence,
+              workProducts: approvedAlternatives,
               verify: verifyStitchScreen,
             });
           } catch {
-            throw conflict("Stitch screen verification is required before design completion", {
+            throw conflict("Design needs a verified Stitch screen or an approved alternative work product", {
               code: "stitch_evidence_required",
             });
           }
