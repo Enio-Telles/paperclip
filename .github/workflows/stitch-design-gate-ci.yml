@@ -1,0 +1,38 @@
+name: Stitch Design Gate Validation
+
+on:
+  pull_request:
+    paths:
+      - "server/src/services/stitch-completion-gate.ts"
+      - "server/src/services/stitch-completion-gate.test.ts"
+      - "server/src/services/issues.ts"
+      - ".github/workflows/stitch-design-gate-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stitch-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+      - name: Install locked workspace dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build SDK dependencies
+        run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+      - name: Build runner TypeScript
+        run: pnpm --filter @paperclipai/paperclip-runner build:typescript
+      - name: Validate Stitch gate focused tests
+        run: pnpm exec vitest run server/src/services/stitch-completion-gate.test.ts
+      - name: Typecheck Paperclip server
+        run: pnpm exec tsc --noEmit -p server/tsconfig.json
