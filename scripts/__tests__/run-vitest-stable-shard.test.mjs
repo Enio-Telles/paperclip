@@ -118,7 +118,7 @@ test("workspace lanes cover every non-server project in the root Vitest configur
   assert.ok(roots.includes("server"), "expected the explicit root Vitest project list");
   const expected = roots.filter(root => root !== "server")
     .map(root => JSON.parse(readFileSync(path.join(repoRoot, root, "package.json"), "utf8")).name).sort();
-  const actual = ["general-workspaces-a", "general-workspaces-b"]
+  const actual = ["general-workspaces-a", "general-workspaces-b", "general-workspaces-c"]
     .flatMap(group => dryRunJson(["--mode", "general", "--group", group]).workspaceProjects).sort();
   assert.deepEqual(actual, expected, "no configured project may be silently omitted or run twice");
 });
