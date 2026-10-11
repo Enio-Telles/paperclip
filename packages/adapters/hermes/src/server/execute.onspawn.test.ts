@@ -17,6 +17,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
   return {
     ...actual,
+    ensureAbsoluteDirectory: vi.fn(async () => undefined),
     runChildProcess: vi.fn(async () => ({
       exitCode: 0,
       signal: null,
@@ -115,14 +116,76 @@ describe("hermes-local adapter onSpawn forwarding", () => {
 
   it("launches in the assigned task workspace when no cwd was configured", async () => {
     const { ctx } = makeCtx();
-    await execute({ ...ctx, context: { ...ctx.context, paperclipWorkspace: { cwd: "/private/qa/agent-workspace" } } } as any);
+    await execute({ ...ctx, context: { ...ctx.context, paperclipWorkspace: { cwd: "/private/qa/agent-workspace", source: "task_session" } } } as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![3].cwd).toBe("/private/qa/agent-workspace");
   });
 
   it("preserves an explicitly configured cwd", async () => {
     const { ctx } = makeCtx({ cwd: "/private/qa/configured-workspace" });
-    await execute({ ...ctx, context: { ...ctx.context, paperclipWorkspace: { cwd: "/private/qa/agent-workspace" } } } as any);
+    await execute({ ...ctx, context: { ...ctx.context, paperclipWorkspace: { cwd: "/private/qa/agent-workspace", source: "agent_home" } } } as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![3].cwd).toBe("/private/qa/configured-workspace");
+  });
+
+  it("passes only current project workspace metadata to runChildProcess", async () => {
+    const { ctx } = makeCtx({
+      env: {
+        AGENT_HOME: "/old/agent",
+        PAPERCLIP_WORKSPACE_CWD: "/old/project",
+        PAPERCLIP_WORKSPACE_REPO_URL: "https://user:token@old.invalid/repo",
+      },
+    });
+    await execute({
+      ...ctx,
+      context: {
+        ...ctx.context,
+        paperclipWorkspace: {
+          source: "project_primary", cwd: "/new/project",
+          repoUrl: "https://username:fakepass@github.com/acme/repo.git?auth=secret",
+          branchName: "main",
+        },
+      },
+    } as any);
+    const last = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    const env = last[3].env as Record<string, string>;
+    expect(last[3].cwd).toBe("/new/project");
+    expect(env.PAPERCLIP_WORKSPACE_CWD).toBe("/new/project");
+    expect(env.PAPERCLIP_WORKSPACE_REPO_URL).toBe("https://github.com/acme/repo.git");
+    expect(env.AGENT_HOME).toBeUndefined();
+    expect(env.PAPERCLIP_WORKSPACE_BRANCH).toBe("main");
+    expect(JSON.stringify(env)).not.toContain("fakepass");
+  });
+
+  it("refuses to launch a project run when workspace directory validation fails", async () => {
+    const { ctx } = makeCtx();
+    vi.mocked(serverUtils.ensureAbsoluteDirectory).mockRejectedValueOnce(new Error("not a workspace directory"));
+    await expect(execute({
+      ...ctx, context: { ...ctx.context, paperclipWorkspace: { source: "project_primary", cwd: "/invalid/path" } },
+    } as any)).rejects.toThrow("not a workspace directory");
+    expect(vi.mocked(serverUtils.runChildProcess)).not.toHaveBeenCalled();
+  });
+
+  it("does not resume a Hermes session from a different project checkout", async () => {
+    const { ctx } = makeCtx({ persistSession: true });
+    await execute({
+      ...ctx,
+      runtime: { ...ctx.runtime, sessionParams: { sessionId: "previous-session", cwd: "/other/project" } },
+      context: { ...ctx.context, paperclipWorkspace: { source: "task_session", cwd: "/current/project" } },
+    } as any);
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(call[2]).not.toContain("--resume");
+    expect(call[3].cwd).toBe("/current/project");
+  });
+
+  it("resumes a Hermes session when its checkout is unchanged", async () => {
+    const { ctx } = makeCtx({ persistSession: true });
+    await execute({
+      ...ctx,
+      runtime: { ...ctx.runtime, sessionParams: { sessionId: "stable-session", cwd: "/current/project" } },
+      context: { ...ctx.context, paperclipWorkspace: { source: "project_primary", cwd: "/current/project" } },
+    } as any);
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(call[2]).toContain("--resume");
+    expect(call[2]).toContain("stable-session");
   });
 
   it("runChildProcess opts type includes onSpawn", () => {

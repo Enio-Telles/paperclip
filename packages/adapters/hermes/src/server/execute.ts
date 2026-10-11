@@ -77,22 +77,143 @@ export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
 }
 
-/** Use the Paperclip-selected run workspace, not the agent's fallback process cwd. */
+/** The heartbeat owns the source for every run-scoped project workspace. */
+function hermesWorkspace(context?: Record<string, unknown>): Record<string, unknown> | null {
+  const value = context?.paperclipWorkspace;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function isProjectWorkspace(context?: Record<string, unknown>): boolean {
+  const source = hermesWorkspace(context)?.source;
+  return source === "project_primary" || source === "task_session";
+}
+
+/** Refuse to launch a project run from the wrong checkout or an unknown source. */
 export function resolveHermesCwd(
   config: Record<string, unknown>,
   context?: Record<string, unknown>,
 ): string {
-  const runWorkspace = context?.paperclipWorkspace;
-  const workspace =
-    runWorkspace && typeof runWorkspace === "object" && !Array.isArray(runWorkspace)
-      ? (runWorkspace as Record<string, unknown>)
-      : null;
-  const runCwd = cfgString(workspace?.cwd);
-  const projectCwd =
-    workspace?.source === "project_primary" || workspace?.source === "task_session"
-      ? runCwd
-      : undefined;
-  return projectCwd || cfgString(config.cwd) || runCwd || cfgString(config.workspaceDir) || ".";
+  const workspace = hermesWorkspace(context);
+  const source = workspace?.source;
+  const selectedCwd = cfgString(workspace?.cwd);
+  if (cfgString(context?.projectId) && (!workspace || !cfgString(source))) {
+    throw new Error("Hermes project-linked run is missing a resolved workspace source");
+  }
+  if (source === "project_primary" || source === "task_session") {
+    if (!selectedCwd || !path.isAbsolute(selectedCwd)) {
+      throw new Error("Hermes project workspace has no valid absolute cwd");
+    }
+    return selectedCwd;
+  }
+  if (workspace && source !== "agent_home" && (selectedCwd || cfgString(context?.projectId))) {
+    throw new Error("Hermes received an unrecognized workspace source");
+  }
+  // Explicit agent cwd remains authoritative for projectless executions.
+  return cfgString(config.cwd) || selectedCwd || cfgString(config.workspaceDir) || ".";
+}
+
+/** Prevent reuse of a persisted Hermes session against a different project checkout. */
+export function resolveHermesSessionId(
+  params: Record<string, unknown> | null | undefined,
+  context: Record<string, unknown> | undefined,
+  cwd: string,
+  persist: boolean,
+): string | undefined {
+  if (!persist) return undefined;
+  const id = cfgString(params?.sessionId);
+  if (!id) return undefined;
+  if (!isProjectWorkspace(context)) return id;
+  const previous = cfgString(params?.cwd);
+  return previous && path.isAbsolute(previous) && path.resolve(previous) === path.resolve(cwd)
+    ? id
+    : undefined;
+}
+
+/** Repo URLs in child environment must never retain userinfo or query credentials. */
+function publicHermesRepoUrl(raw: unknown): string | undefined {
+  const source = cfgString(raw);
+  if (!source) return undefined;
+  try {
+    const url = new URL(source);
+    if (!["https:", "http:", "ssh:", "git:"].includes(url.protocol)) return undefined;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    // Omit scp-like and otherwise non-standard remote URLs instead of leaking userinfo.
+    return undefined;
+  }
+}
+
+/** Make only the current run's minimal workspace metadata visible to Hermes. */
+export function buildHermesWorkspaceEnv(
+  env: Record<string, string>,
+  context: Record<string, unknown> | undefined,
+  cwd: string,
+): Record<string, string> {
+  // Environment from config or the server process is not authoritative for a run.
+  for (const key of Object.keys(env)) {
+    if (key === "AGENT_HOME" ||
+        key.startsWith("PAPERCLIP_WORKSPACE_") ||
+        key.startsWith("PAPERCLIP_WORKSPACES_")) {
+      delete env[key];
+    }
+  }
+  const workspace = hermesWorkspace(context);
+  if (!workspace) return env;
+  const source = cfgString(workspace.source);
+  if (source !== "project_primary" && source !== "task_session" && source !== "agent_home") {
+    throw new Error("Hermes received an unrecognized workspace source");
+  }
+
+  env.PAPERCLIP_WORKSPACE_CWD = cwd;
+  env.PAPERCLIP_WORKSPACE_SOURCE = source;
+  const fields: Array<[string, unknown]> = [
+    ["PAPERCLIP_WORKSPACE_STRATEGY", workspace.strategy],
+    ["PAPERCLIP_WORKSPACE_ID", workspace.workspaceId],
+    ["PAPERCLIP_WORKSPACE_REPO_REF", workspace.repoRef],
+    ["PAPERCLIP_WORKSPACE_BRANCH", workspace.branchName],
+    ["PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspace.worktreePath],
+    ["AGENT_HOME", workspace.agentHome],
+  ];
+  for (const [key, value] of fields) {
+    const str = cfgString(value);
+    if (str) env[key] = str;
+  }
+  const publicUrl = publicHermesRepoUrl(workspace.repoUrl);
+  if (publicUrl) env.PAPERCLIP_WORKSPACE_REPO_URL = publicUrl;
+
+  if (!Array.isArray(context?.paperclipWorkspaces)) return env;
+  const MAX_HINT_BYTES = 16_000;
+  const hints: Record<string, string>[] = [];
+  let size = 2; // []
+  let total = 0;
+  for (const raw of context.paperclipWorkspaces) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const hint = raw as Record<string, unknown>;
+    const projectId = cfgString(hint.projectId);
+    const hintCwd = cfgString(hint.cwd);
+    if (!projectId || !hintCwd || !path.isAbsolute(hintCwd)) continue;
+    total++;
+    const item: Record<string, string> = { projectId, cwd: hintCwd };
+    for (const key of ["workspaceId", "repoRef"] as const) {
+      const str = cfgString(hint[key]);
+      if (str) item[key] = str;
+    }
+    const encoded = JSON.stringify(item);
+    const bytes = Buffer.byteLength(encoded, "utf8") + (hints.length ? 1 : 0);
+    if (size + bytes > MAX_HINT_BYTES) continue;
+    hints.push(item);
+    size += bytes;
+  }
+  env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(hints);
+  env.PAPERCLIP_WORKSPACES_COUNT = String(hints.length);
+  if (hints.length < total) env.PAPERCLIP_WORKSPACES_TRUNCATED = "1";
+  return env;
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +489,13 @@ export async function execute(
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
-  const prevSessionId = cfgString(
-    (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
+  const runContext = ctx.context as Record<string, unknown> | undefined;
+  const cwd = resolveHermesCwd(config, runContext);
+  const sessionId = resolveHermesSessionId(
+    ctx.runtime?.sessionParams as Record<string, unknown> | null,
+    runContext,
+    cwd,
+    persistSession,
   );
 
   // The server adds this runtime inventory at the run boundary. Requiring the
@@ -450,7 +576,6 @@ export async function execute(
   }
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  const sessionId = persistSession ? prevSessionId : undefined;
   const prompt = buildPrompt(ctx, config, { resumedSession: Boolean(sessionId) });
 
   // ── Build command args ─────────────────────────────────────────────────
@@ -534,12 +659,16 @@ export async function execute(
   const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
 
-  // ── Resolve working directory ──────────────────────────────────────────
-  const cwd = resolveHermesCwd(config, ctx.context as Record<string, unknown> | undefined);
+  // The child must only receive metadata authorized for this run, not stale server
+  // or agent-configured workspace variables.
+  buildHermesWorkspaceEnv(env, runContext, cwd);
+
+  // Project and task-session directories are security boundaries: fail closed.
   try {
     await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
+  } catch (error) {
+    if (isProjectWorkspace(runContext)) throw error;
+    // Retain legacy behavior for direct, projectless adapter calls only.
   }
 
   // ── Log start ──────────────────────────────────────────────────────────
@@ -636,7 +765,9 @@ export async function execute(
 
   // Store session ID for next run
   if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
+    executionResult.sessionParams = isProjectWorkspace(runContext)
+      ? { sessionId: parsed.sessionId, cwd }
+      : { sessionId: parsed.sessionId };
     executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
   }
 
