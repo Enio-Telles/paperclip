@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { expect, test } from "vitest";
 
 import { HERMES_CLI } from "../shared/constants.js";
-import { resolveHermesCommand } from "./execute.js";
+import { resolveHermesCommand, resolveHermesCwd } from "./execute.js";
 import { testEnvironment } from "./test.js";
 
 test("resolveHermesCommand prefers hermesCommand over command", () => {
@@ -64,4 +64,28 @@ test("managed connections probe the selected environment without falling back to
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("resolveHermesCwd chooses the run workspace over agent-level cwd", () => {
+  const config = { cwd: "/old/agent/directory", workspaceDir: "/old/legacy/directory" };
+  const context = { paperclipWorkspace: { cwd: "/run/resolved/project", source: "project_primary" } };
+  expect(resolveHermesCwd(config, context)).toBe("/run/resolved/project");
+});
+
+test("resolveHermesCwd preserves legacy fallback when no run workspace exists", () => {
+  expect(resolveHermesCwd({ cwd: "/agent/configured" }, {})).toBe("/agent/configured");
+  expect(resolveHermesCwd({ workspaceDir: "/legacy/project" }, {})).toBe("/legacy/project");
+  expect(resolveHermesCwd({}, {})).toBe(".");
+});
+
+test("resolveHermesCwd ignores malformed run workspace context", () => {
+  expect(resolveHermesCwd({ cwd: "/agent/configured" }, { paperclipWorkspace: { cwd: 17 } }))
+    .toBe("/agent/configured");
+});
+
+test("resolveHermesCwd preserves explicit agent cwd for projectless fallback", () => {
+  expect(resolveHermesCwd(
+    { cwd: "/agent/explicit" },
+    { paperclipWorkspace: { cwd: "/run/fallback-agent-home", source: "agent_home" } },
+  )).toBe("/agent/explicit");
 });

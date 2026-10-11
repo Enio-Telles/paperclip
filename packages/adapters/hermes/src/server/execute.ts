@@ -77,6 +77,24 @@ export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
 }
 
+/** Use the Paperclip-selected run workspace, not the agent's fallback process cwd. */
+export function resolveHermesCwd(
+  config: Record<string, unknown>,
+  context?: Record<string, unknown>,
+): string {
+  const runWorkspace = context?.paperclipWorkspace;
+  const workspace =
+    runWorkspace && typeof runWorkspace === "object" && !Array.isArray(runWorkspace)
+      ? (runWorkspace as Record<string, unknown>)
+      : null;
+  const runCwd = cfgString(workspace?.cwd);
+  const projectCwd =
+    workspace?.source === "project_primary" || workspace?.source === "task_session"
+      ? runCwd
+      : undefined;
+  return projectCwd || cfgString(config.cwd) || runCwd || cfgString(config.workspaceDir) || ".";
+}
+
 // ---------------------------------------------------------------------------
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
@@ -517,12 +535,7 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
 
   // ── Resolve working directory ──────────────────────────────────────────
-  const workspace = ctx.context?.paperclipWorkspace;
-  const workspaceCwd = workspace && typeof workspace === "object"
-    ? cfgString((workspace as Record<string, unknown>).cwd)
-    : undefined;
-  const cwd =
-    cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
+  const cwd = resolveHermesCwd(config, ctx.context as Record<string, unknown> | undefined);
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
