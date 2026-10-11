@@ -3,6 +3,7 @@ import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, a
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { fallbackWorkProductIds, rejectInitialStitchDone, shouldCheckStitchTransition, stitchGateConfig, verifyStitchCompletion, verifyStitchScreen } from "./stitch-completion-gate.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
@@ -10395,6 +10396,23 @@ export function issueService(db: Db) {
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
         }
+        // A new design issue cannot start at Done because no Stitch proof
+        // comment can exist prior to insertion.
+        const designGate = stitchGateConfig();
+        if (designGate) {
+          try {
+            rejectInitialStitchDone({
+              ...designGate,
+              issue: { id: "", companyId, assigneeAgentId: values.assigneeAgentId,
+                status: values.status ?? "backlog",
+                isDesignIssue: (inputLabelIds ?? []).includes(designGate.labelId) },
+            });
+          } catch {
+            throw conflict("Stitch evidence is required before creating a completed design issue", {
+              code: "stitch_evidence_required",
+            });
+          }
+        }
         if (values.status === "done") {
           values.completedAt = new Date();
         }
@@ -11208,6 +11226,89 @@ export function issueService(db: Db) {
             patch.privacyRootIssueId = privacyParent.privacyRootIssueId ?? privacyParent.id;
           } else if (issueData.visibility === "private") {
             patch.privacyRootIssueId = receiptExisting.id;
+          }
+        }
+        // The Stitch design gate is checked while the issue row is locked,
+        // BEFORE the status write. It is scope-limited and disabled unless
+        // PAPERCLIP_STITCH_GATE_COMPANY_ID/AGENT_ID are explicitly configured.
+        const stitchGate = stitchGateConfig();
+        if (stitchGate && receiptExisting.companyId === stitchGate.companyId) {
+          const [previousDesignLabel] = await tx
+            .select({ labelId: issueLabels.labelId })
+            .from(issueLabels)
+            .where(and(
+              eq(issueLabels.companyId, receiptExisting.companyId),
+              eq(issueLabels.issueId, receiptExisting.id),
+              eq(issueLabels.labelId, stitchGate.labelId),
+            ))
+            .limit(1);
+          // Consider existing and next labels, preventing removal of a design
+          // label in the same update from bypassing evidence verification.
+          const hasDesignLabel = Boolean(previousDesignLabel) ||
+            (nextLabelIds ?? []).includes(stitchGate.labelId);
+          const shouldCheck = shouldCheckStitchTransition({
+            existingStatus: receiptExisting.status,
+            nextStatus: patch.status,
+            previousAssignee: receiptExisting.assigneeAgentId,
+            nextAssignee: patch.assigneeAgentId,
+            isDesignIssue: hasDesignLabel,
+            designLabelAdded: !previousDesignLabel &&
+              (nextLabelIds ?? []).includes(stitchGate.labelId),
+            designerId: stitchGate.designerId,
+          });
+          if (shouldCheck) {
+            const evidence = await tx
+              .select({ authorAgentId: issueComments.authorAgentId, body: issueComments.body })
+              .from(issueComments)
+              .where(and(
+                eq(issueComments.companyId, receiptExisting.companyId),
+                eq(issueComments.issueId, receiptExisting.id),
+                isNull(issueComments.deletedAt),
+                eq(issueComments.authorAgentId, stitchGate.designerId),
+              ))
+              .orderBy(desc(issueComments.createdAt));
+            const referencedIds = fallbackWorkProductIds(evidence, stitchGate.designerId);
+            // Only read UUIDs explicitly cited by signed receipts: no
+            // arbitrary LIMIT can hide an approved alternative.
+            const approvedAlternatives = referencedIds.length > 0
+              ? await tx
+                .select({
+                  id: issueWorkProducts.id,
+                  companyId: issueWorkProducts.companyId,
+                  issueId: issueWorkProducts.issueId,
+                  type: issueWorkProducts.type,
+                  provider: issueWorkProducts.provider,
+                  status: issueWorkProducts.status,
+                  reviewState: issueWorkProducts.reviewState,
+                  url: issueWorkProducts.url,
+                })
+                .from(issueWorkProducts)
+                .where(and(
+                  eq(issueWorkProducts.companyId, receiptExisting.companyId),
+                  eq(issueWorkProducts.issueId, receiptExisting.id),
+                  inArray(issueWorkProducts.id, referencedIds),
+                  eq(issueWorkProducts.status, "approved"),
+                  eq(issueWorkProducts.reviewState, "approved"),
+                  inArray(issueWorkProducts.type, ["artifact", "preview_url", "document"]),
+                  inArray(issueWorkProducts.provider, ["figma", "agy-carine", "frontend-code", "manual"]),
+                  isNotNull(issueWorkProducts.url),
+                ))
+              : [];
+            try {
+              await verifyStitchCompletion({
+                ...stitchGate,
+                issue: { id: receiptExisting.id, companyId: receiptExisting.companyId,
+                  assigneeAgentId: stitchGate.designerId, status: receiptExisting.status,
+                  isDesignIssue: hasDesignLabel },
+                comments: evidence,
+                workProducts: approvedAlternatives,
+                verify: verifyStitchScreen,
+              });
+            } catch {
+              throw conflict("Design needs verified Stitch or an approved alternative work product", {
+                code: "stitch_evidence_required",
+              });
+            }
           }
         }
         if (actorAgentId && actorRunId) {
