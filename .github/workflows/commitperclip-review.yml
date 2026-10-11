@@ -36,11 +36,19 @@ jobs:
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          # Preserve upstream App token, but allow public forks to use the
+          # built-in scoped Actions token when the private key is absent.
+          # Dependency Review and the full quality-gate script still run.
+          if [ -n "$COMMITPERCLIP_KEY" ]; then
+            TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          else
+            TOKEN="$GITHUB_TOKEN"
+          fi
           echo "::add-mask::$TOKEN"
-          echo "value=$TOKEN" >> $GITHUB_OUTPUT
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Run quality gates
         id: quality
