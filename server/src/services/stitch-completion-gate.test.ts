@@ -215,6 +215,12 @@ describe("reviewed design fallback",()=>{
     await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
       workProducts:[{...product,url:"https://"}],verify:async()=>false})).rejects.toThrow();
   });
+  it("uses an already approved alternative without waiting for Stitch",async()=>{
+    const verify=vi.fn(async()=>{throw Error("Stitch offline")});
+    await expect(verifyStitchCompletion({...config,issue,
+      comments:[proof,fallback],workProducts:[product],verify})).resolves.toBeUndefined();
+    expect(verify).not.toHaveBeenCalled();
+  });
   it("rejects an unapproved fallback work product",async()=>{
     await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
       workProducts:[{...product,reviewState:"none"}],verify:async()=>false})).rejects.toThrow();

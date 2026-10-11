@@ -125,11 +125,14 @@ function validReviewedFallback(options:StitchDoneGateOptions): boolean {
 export async function verifyStitchCompletion(options: StitchDoneGateOptions): Promise<void> {
   const {companyId, designerId, issue, comments, verify} = options;
   if (issue.companyId !== companyId || issue.assigneeAgentId !== designerId || issue.isDesignIssue !== true) return;
+  // An already reviewed alternate deliverable requires no network call.
+  // The Stitch-first preference applies to authoring, not to rechecking a
+  // previously approved fallback while holding the database row lock.
+  if(validReviewedFallback(options))return;
   const pair=comments.map((x)=>parseEvidence(x,designerId)).find((x)=>x!==null);
   if(pair){
-    try{if(await verify(...pair))return;}catch{/* try a reviewed alternate design */}
+    try{if(await verify(...pair))return;}catch{/* no approved alternative */}
   }
-  if(validReviewedFallback(options))return;
   throw Error("Design completion needs verified Stitch screen or an approved alternative work product");
 }
 
