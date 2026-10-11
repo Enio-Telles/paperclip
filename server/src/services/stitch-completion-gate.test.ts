@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { verifyStitchCompletion, verifyStitchScreen, rejectInitialStitchDone, stitchGateConfig } from "./stitch-completion-gate.js";
+import { verifyStitchCompletion, verifyStitchScreen, rejectInitialStitchDone, stitchGateConfig, shouldCheckStitchTransition, fallbackWorkProductIds } from "./stitch-completion-gate.js";
 
 const companyId="company-test";
 const designerId="design-agent-test";
-const issue={id:"issue-test",companyId,assigneeAgentId:designerId,status:"in_review"};
+const issue={id:"issue-test",companyId,assigneeAgentId:designerId,status:"in_review",isDesignIssue:true};
 const config={companyId,designerId};
 const proof={authorAgentId:designerId,body:'STITCH_EVIDENCE: {"project_id":"projects/12","screen_id":"screens/34"}'};
 
@@ -105,6 +105,20 @@ describe("Stitch MCP integration",()=>{
     }));
     await expect(verifyStitchScreen("projects/12","screens/34")).resolves.toBe(true);
   });
+  it("uses one overall MCP deadline across all requests",async()=>{
+    const signals:AbortSignal[]=[];
+    vi.stubGlobal("fetch",vi.fn(async(_url:string,init:any)=>{
+      signals.push(init.signal);
+      const body=JSON.parse(init.body);
+      if(body.method==="notifications/initialized")return new Response(null,{status:202});
+      const result=body.method==="initialize"?{protocolVersion:"2025-03-26"}:{content:[{type:"text",text:"screen"}]};
+      return new Response("data: "+JSON.stringify({jsonrpc:"2.0",id:body.id,result})+"\n\n",{status:200});
+    }));
+    await expect(verifyStitchScreen("projects/12","screens/34")).resolves.toBe(true);
+    expect(signals).toHaveLength(3);
+    expect(signals[0]).toBe(signals[1]);
+    expect(signals[1]).toBe(signals[2]);
+  });
   it("fails closed when Stitch MCP returns an error",async()=>{
     vi.stubGlobal("fetch",vi.fn(async(_url: string,init: any)=>{
       const body=JSON.parse(init.body);
@@ -123,10 +137,16 @@ describe("scope normalization",()=>{
   it("normalizes uppercase config UUIDs to match database IDs",()=>{
     const company="16cfee44-52ba-4fb8-bc24-d4a2edfd00db";
     const designer="4b21d3b2-9d11-4b1c-884e-292742b7894a";
+    const designLabel="88888888-8888-4888-8888-888888888888";
     expect(stitchGateConfig({
       PAPERCLIP_STITCH_GATE_COMPANY_ID:company.toUpperCase(),
       PAPERCLIP_STITCH_GATE_AGENT_ID:designer.toUpperCase(),
-    })).toEqual({companyId:company,designerId:designer});
+      PAPERCLIP_STITCH_GATE_LABEL_ID:designLabel.toUpperCase(),
+    })).toEqual({companyId:company,designerId:designer,labelId:designLabel});
+    expect(stitchGateConfig({
+      PAPERCLIP_STITCH_GATE_COMPANY_ID:company,
+      PAPERCLIP_STITCH_GATE_AGENT_ID:designer,
+    })).toBeNull();
     expect(stitchGateConfig({
       PAPERCLIP_STITCH_GATE_COMPANY_ID:"invalid",
       PAPERCLIP_STITCH_GATE_AGENT_ID:designer,
@@ -134,6 +154,51 @@ describe("scope normalization",()=>{
   });
 });
 
+describe("scope and update transitions",()=>{
+  const scope={companyId,designerId,labelId:"88888888-8888-4888-8888-888888888888"};
+  it("requires design label even for a design-agent Done",async()=>{
+    const verify=vi.fn(async()=>true);
+    await expect(verifyStitchCompletion({...scope,issue:{...issue,isDesignIssue:false},comments:[],verify})).resolves.toBeUndefined();
+    expect(verify).not.toHaveBeenCalled();
+    expect(()=>rejectInitialStitchDone({...scope,issue:{...issue,status:"done",isDesignIssue:false}})).not.toThrow();
+  });
+  it("gates reassigning a completed labeled issue to the designer without a status patch",()=>{
+    expect(shouldCheckStitchTransition({
+      existingStatus:"done",nextStatus:undefined,
+      previousAssignee:"other",nextAssignee:designerId,
+      isDesignIssue:true,designerId,
+    })).toBe(true);
+  });
+  it("checks adding a design label to an already Done issue",()=>{
+    expect(shouldCheckStitchTransition({
+      existingStatus:"done",nextStatus:undefined,
+      previousAssignee:designerId,nextAssignee:undefined,
+      isDesignIssue:true,designLabelAdded:true,designerId,
+    })).toBe(true);
+  });
+  it("does not gate unrelated assignment changes",()=>{
+    expect(shouldCheckStitchTransition({
+      existingStatus:"done",nextStatus:undefined,
+      previousAssignee:"other",nextAssignee:designerId,
+      isDesignIssue:false,designerId,
+    })).toBe(false);
+  });
+  it("gates direct Done transition for labeled issues assigned to designer",()=>{
+    expect(shouldCheckStitchTransition({
+      existingStatus:"in_review",nextStatus:"done",
+      previousAssignee:designerId,nextAssignee:undefined,
+      isDesignIssue:true,designerId,
+    })).toBe(true);
+  });
+});
+describe("indexed work product evidence",()=>{
+  it("extracts only a designer-authored UUID from latest fallback receipt",()=>{
+    const good='11111111-1111-4111-8111-111111111111';
+    const body='DESIGN_FALLBACK_EVIDENCE: {"reason":"stitch_unavailable","method":"agy-carine","work_product_id":"'+good+'"}';
+    expect(fallbackWorkProductIds([{authorAgentId:designerId,body},
+      {authorAgentId:"other",body:body.replace(good,"22222222-2222-4222-8222-222222222222")}],designerId)).toEqual([good]);
+  });
+});
 describe("reviewed design fallback",()=>{
   const fallback={authorAgentId:designerId,
     body:'DESIGN_FALLBACK_EVIDENCE: {"reason":"stitch_unavailable","method":"agy-carine","work_product_id":"11111111-1111-4111-8111-111111111111"}'};
@@ -143,6 +208,12 @@ describe("reviewed design fallback",()=>{
   it("accepts an approved real work product when Stitch is unavailable",async()=>{
     await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
       workProducts:[product],verify:async()=>{throw Error("Stitch offline")}})).resolves.toBeUndefined();
+  });
+  it("rejects malformed HTTPS URLs despite artifact review approval",async()=>{
+    await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
+      workProducts:[{...product,url:"https://?"}],verify:async()=>false})).rejects.toThrow();
+    await expect(verifyStitchCompletion({...config,issue,comments:[fallback],
+      workProducts:[{...product,url:"https://"}],verify:async()=>false})).rejects.toThrow();
   });
   it("rejects an unapproved fallback work product",async()=>{
     await expect(verifyStitchCompletion({...config,issue,comments:[fallback],

@@ -4,7 +4,7 @@
  * The network endpoint is pinned to loopback.
  */
 export interface StitchComment { authorAgentId?: string | null; body: string }
-export interface StitchIssue { id: string; companyId: string; assigneeAgentId?: string | null; status: string }
+export interface StitchIssue { id: string; companyId: string; assigneeAgentId?: string | null; status: string; isDesignIssue?: boolean }
 export type StitchVerify = (projectId: string, screenId: string) => Promise<boolean>;
 export interface DesignWorkProduct {
   id: string; companyId: string; issueId: string; type: string;
@@ -41,8 +41,8 @@ function parseEvidence(comment: StitchComment, author: string): [string,string] 
 export function rejectInitialStitchDone({
   companyId,designerId,issue,
 }: Pick<StitchDoneGateOptions,"companyId"|"designerId"|"issue">): void {
-  if (issue.companyId===companyId && issue.assigneeAgentId===designerId
-    && issue.status==="done")
+  if (issue.companyId===companyId && issue.isDesignIssue===true
+    && issue.assigneeAgentId===designerId && issue.status==="done")
     throw Error("Stitch proof required before initial design Done");
 }
 
@@ -69,6 +69,43 @@ function fallbackEvidence(comment: StitchComment, author: string):
   }
   return null;
 }
+export function fallbackWorkProductIds(comments:StitchComment[],designerId:string): string[] {
+  const ids=new Set<string>();
+  for(const comment of comments){
+    const proof=fallbackEvidence(comment,designerId);
+    if(proof)ids.add(proof.workProductId.toLowerCase());
+  }
+  return [...ids];
+}
+function isValidPreviewUrl(url:string):boolean {
+  try {
+    const parsed=new URL(url);
+    if(parsed.username || parsed.password)return false;
+    return Boolean(parsed.hostname) && (
+      parsed.protocol==="https:" ||
+      (parsed.protocol==="http:" && parsed.hostname==="127.0.0.1")
+    );
+  }catch{return false;}
+}
+export interface StitchTransitionOptions {
+  existingStatus:string;
+  nextStatus:string|undefined;
+  previousAssignee:string|null|undefined;
+  nextAssignee:string|null|undefined;
+  isDesignIssue:boolean;
+  designLabelAdded?:boolean;
+  designerId:string;
+}
+export function shouldCheckStitchTransition(o:StitchTransitionOptions):boolean {
+  if(!o.isDesignIssue)return false;
+  if(o.nextStatus==="done" && o.existingStatus!=="done")
+    return o.previousAssignee===o.designerId || o.nextAssignee===o.designerId;
+  return o.existingStatus==="done" && (
+    (o.nextAssignee===o.designerId && o.previousAssignee!==o.designerId) ||
+    (o.designLabelAdded===true &&
+      (o.previousAssignee===o.designerId || o.nextAssignee===o.designerId))
+  );
+}
 function validReviewedFallback(options:StitchDoneGateOptions): boolean {
   const {issue,comments,workProducts=[],designerId}=options;
   for(const comment of comments){
@@ -79,8 +116,7 @@ function validReviewedFallback(options:StitchDoneGateOptions): boolean {
       x.reviewState==="approved" && x.status==="approved" &&
       (x.type==="artifact" || x.type==="preview_url" || x.type==="document") &&
       x.provider===proof.method &&
-      typeof x.url==="string" &&
-      (/^https:\/\/[^\s]+$/i.test(x.url) || /^http:\/\/127\.0\.0\.1(?::\d+)?\//.test(x.url)));
+      typeof x.url==="string" && isValidPreviewUrl(x.url));
     if(product)return true;
   }
   return false;
@@ -88,7 +124,7 @@ function validReviewedFallback(options:StitchDoneGateOptions): boolean {
 
 export async function verifyStitchCompletion(options: StitchDoneGateOptions): Promise<void> {
   const {companyId, designerId, issue, comments, verify} = options;
-  if (issue.companyId !== companyId || issue.assigneeAgentId !== designerId) return;
+  if (issue.companyId !== companyId || issue.assigneeAgentId !== designerId || issue.isDesignIssue !== true) return;
   const pair=comments.map((x)=>parseEvidence(x,designerId)).find((x)=>x!==null);
   if(pair){
     try{if(await verify(...pair))return;}catch{/* try a reviewed alternate design */}
@@ -126,6 +162,8 @@ export async function verifyStitchScreen(projectId: string, screenId: string): P
     "/screens/"+screenId.replace(/^screens\//,"");
   let sessionId:string|null=null;
   let version:string|null=null;
+  // One deadline for initialize, initialized notification and tools/call.
+  const deadlineSignal=AbortSignal.timeout(2500);
   const exchange=async(id:number|null,method:string,params:Record<string,unknown>)=>{
     const headers:Record<string,string>={
       "Content-Type":"application/json",Accept:"application/json, text/event-stream",
@@ -135,7 +173,7 @@ export async function verifyStitchScreen(projectId: string, screenId: string): P
     const payload:Record<string,unknown>={jsonrpc:"2.0",method,params};
     if(id!==null)payload.id=id;
     const response=await fetch(STITCH_MCP_URL,{
-      method:"POST",headers,signal:AbortSignal.timeout(3500),
+      method:"POST",headers,signal:deadlineSignal,
       body:JSON.stringify(payload),
     });
     if(!response.ok)throw Error("Stitch MCP unavailable");
@@ -179,9 +217,10 @@ export async function verifyStitchScreen(projectId: string, screenId: string): P
 }
 
 export function stitchGateConfig(env:NodeJS.ProcessEnv=process.env):
-  {companyId:string;designerId:string}|null {
+  {companyId:string;designerId:string;labelId:string}|null {
   const companyId=env.PAPERCLIP_STITCH_GATE_COMPANY_ID?.trim().toLowerCase();
   const designerId=env.PAPERCLIP_STITCH_GATE_AGENT_ID?.trim().toLowerCase();
-  if(!companyId||!designerId || !UUID.test(companyId) || !UUID.test(designerId))return null;
-  return {companyId,designerId};
+  const labelId=env.PAPERCLIP_STITCH_GATE_LABEL_ID?.trim().toLowerCase();
+  if(!companyId||!designerId||!labelId || !UUID.test(companyId) || !UUID.test(designerId) || !UUID.test(labelId))return null;
+  return {companyId,designerId,labelId};
 }
